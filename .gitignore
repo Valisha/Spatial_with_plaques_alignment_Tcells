@@ -1,2 +1,10 @@
 .DS_Store
 __pycache__/
+# Local/generated spatial analysis outputs
+plaque_results/
+cluster_annotation/
+*.h5ad
+*.h5
+*.loom
+*.zarr/
+.ipynb_checkpoints/
