@@ -86,7 +86,9 @@ PLAQUE_CHANNEL_INDEX = None
 RUN_PLAQUE_SEGMENTATION = True
 
 # Plaque segmentation thresholds. Tune after inspecting qc_plaque_segmentation.png.
-PLAQUE_SMOOTH_SIGMA = 1.0
+PLAQUE_THRESHOLD_MODE = "absolute"  # "absolute" uses raw intensity; "otsu" uses image-adaptive thresholding.
+PLAQUE_ABSOLUTE_THRESHOLD = 2975.0
+PLAQUE_SMOOTH_SIGMA = 0.0
 PLAQUE_THRESHOLD_MULTIPLIER = 1.0
 MIN_PLAQUE_AREA_UM2 = 25.0
 MAX_HOLE_AREA_UM2 = 25.0
@@ -191,10 +193,10 @@ def parse_ome_pixels(ome_xml: str | None) -> dict[str, Any]:
 
 def inspect_ome_tiff(path: Path) -> dict[str, Any]:
     """Inspect the OME-TIFF pyramid without loading the full image."""
-    with tiff.TiffFile(path) as tf:
-        series = tf.series[0]
+    with tiff.TiffFile(path) as tif:
+        series = tif.series[0]
         levels = getattr(series, "levels", None) or [series]
-        ome_pixels = parse_ome_pixels(tf.ome_metadata)
+        ome_pixels = parse_ome_pixels(tif.ome_metadata)
 
         level_records = []
         for i, level in enumerate(levels):
@@ -269,8 +271,8 @@ def read_ome_level(
     channel_index: int | None = None,
     projection: str = "max",
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    with tiff.TiffFile(path) as tf:
-        series = tf.series[0]
+    with tiff.TiffFile(path) as tif:
+        series = tif.series[0]
         levels = getattr(series, "levels", None) or [series]
         level_index = min(level_index, len(levels) - 1)
         level = levels[level_index]
@@ -530,13 +532,35 @@ def segment_plaques(
     min_area_px = max(1, int(np.ceil(MIN_PLAQUE_AREA_UM2 / pixel_area_um2)))
     hole_area_px = max(1, int(np.ceil(MAX_HOLE_AREA_UM2 / pixel_area_um2)))
 
-    smoothed = gaussian(plaque_img.astype(float), sigma=PLAQUE_SMOOTH_SIGMA, preserve_range=True)
-    threshold = threshold_otsu(smoothed) * PLAQUE_THRESHOLD_MULTIPLIER
-    mask = smoothed > threshold
-    mask = binary_opening(mask, disk(PLAQUE_OPENING_RADIUS_PX))
-    mask = binary_closing(mask, disk(PLAQUE_CLOSING_RADIUS_PX))
+    plaque_values = plaque_img.astype(float, copy=False)
+    if PLAQUE_THRESHOLD_MODE == "absolute":
+        threshold = float(PLAQUE_ABSOLUTE_THRESHOLD)
+        mask = plaque_values >= threshold
+    elif PLAQUE_THRESHOLD_MODE == "otsu":
+        if PLAQUE_SMOOTH_SIGMA and PLAQUE_SMOOTH_SIGMA > 0:
+            threshold_img = gaussian(
+                plaque_values,
+                sigma=PLAQUE_SMOOTH_SIGMA,
+                preserve_range=True,
+            )
+        else:
+            threshold_img = plaque_values
+        threshold = threshold_otsu(threshold_img) * PLAQUE_THRESHOLD_MULTIPLIER
+        mask = threshold_img > threshold
+    else:
+        raise ValueError('PLAQUE_THRESHOLD_MODE must be "absolute" or "otsu".')
+
+    if PLAQUE_OPENING_RADIUS_PX and PLAQUE_OPENING_RADIUS_PX > 0:
+        mask = binary_opening(mask, disk(PLAQUE_OPENING_RADIUS_PX))
+    if PLAQUE_CLOSING_RADIUS_PX and PLAQUE_CLOSING_RADIUS_PX > 0:
+        mask = binary_closing(mask, disk(PLAQUE_CLOSING_RADIUS_PX))
     mask = remove_small_objects(mask, min_size=min_area_px)
     mask = remove_small_holes(mask, area_threshold=hole_area_px)
+    print(
+        f"Plaque threshold mode: {PLAQUE_THRESHOLD_MODE}; "
+        f"threshold={threshold:.3f}; min_area_px={min_area_px}; "
+        f"candidate_pixels={int(mask.sum())}"
+    )
 
     labels = label(mask)
     props = pd.DataFrame(
@@ -565,6 +589,8 @@ def segment_plaques(
     )
     props["plaque_id"] = props["label"].astype(int)
     props["area_um2"] = props["area"] * pixel_area_um2
+    props["threshold_mode"] = PLAQUE_THRESHOLD_MODE
+    props["threshold"] = float(threshold)
 
     fullres_xy = level_to_fullres_points(
         props[["centroid_x_level_px", "centroid_y_level_px"]].to_numpy(float),
@@ -588,7 +614,9 @@ def plot_plaque_segmentation(
 ) -> None:
     fig, ax = plt.subplots(figsize=(12, 12))
     ax.imshow(robust_rescale(plaque_img), cmap="gray", origin="upper")
-    ax.imshow(np.ma.masked_where(~mask, mask), cmap="magma", alpha=0.35, origin="upper")
+    ax.imshow(np.ma.masked_where(~mask, mask), cmap="autumn", alpha=0.45, origin="upper")
+    if mask.any():
+        ax.contour(mask.astype(float), levels=[0.5], colors="cyan", linewidths=0.35)
     if not plaque_df.empty:
         ax.scatter(
             plaque_df["centroid_x_level_px"],
@@ -601,7 +629,7 @@ def plot_plaque_segmentation(
     ax.set_xlim(0, plaque_img.shape[1])
     ax.set_ylim(plaque_img.shape[0], 0)
     ax.set_aspect("equal")
-    ax.set_title("Plaque segmentation")
+    ax.set_title(f"Plaque segmentation: {PLAQUE_THRESHOLD_MODE} threshold {PLAQUE_ABSOLUTE_THRESHOLD:g}")
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
